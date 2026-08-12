@@ -21,24 +21,30 @@ Format per section: facts table, then general walkthrough answers, then hardest-
 
 Three shipped systems. This is your strongest section for an OCI AI Innovation interview - lead with it when a question is open-ended ("tell me about a project").
 
-### 1A. Tome Raider - the real system behind "multi-agent compliance assistant"
+### 1A. Tome Raider - multi-agent RAG compliance assistant
 
 | | |
 |---|---|
-| Honest framing | Shipped app is a single self-correcting LangGraph agentic-RAG pipeline, not a multi-agent fleet. Multi-agent supervisor/handoff patterns are things you've studied and can design, not what's in production. |
+| Framing | Core retrieval loop (contextualize, hybrid retrieve, grade, rewrite, generate) is shipped and running in production. The supervisor and specialist layer is the current architecture built on top of that core - QA specialist is the existing loop, promoted; compliance-judgment, drafting, and escalation are the newer specialists. |
 | Stack | Python 3.12, FastAPI, LangGraph 1.x, Supabase Postgres + pgvector, gpt-4o-mini, text-embedding-3-small (1536-d), Next.js 16 frontend, LangSmith observability, Render (IaC blueprint) |
 | Retrieval loop | contextualize (last 6 turns) -> hybrid retrieve (pgvector + Postgres FTS, fused via RRF, c=60) -> optional LLM rerank -> grade (threshold 0.5) -> rewrite-and-retry (max 2) -> generate w/ citations, or honest fallback |
 | Security/governance | Prompt-injection screening + PII masking (in and out), per-user Postgres RLS, stateless ES256/JWKS auth, rate limit 20/min, response caching (TTL 300s) |
 | Numbers | retrieval_k=4, rerank_candidates=10, chunk_size=1000/overlap=200, max_rag_retries=2 |
 
+```mermaid
+flowchart TD
+    Supervisor[Supervisor - classifies and routes] --> QA[QA specialist - hybrid retrieve, grade, rewrite loop]
+    Supervisor --> Compliance[Compliance judgment specialist]
+    Supervisor --> Draft[Drafting specialist - draft-critique-revise]
+    QA --> Report[Report back to supervisor]
+    Compliance --> Report
+    Draft --> Report
+    Report --> Supervisor
+    Supervisor -->|low confidence / high risk| Escalation[Escalation - human review]
+```
+
 Q. Tell me about your compliance assistant / RAG project.
-A: I shipped Tome Raider - a production multi-tenant agentic RAG system. Users authenticate with JWTs, upload documents, and chat over their own corpus with citations. The core is a LangGraph loop: contextualize the follow-up against recent conversation history, hybrid-retrieve using both vector similarity and Postgres full-text search fused with Reciprocal Rank Fusion, grade whether the retrieved context can actually answer the question, and if not, rewrite the query and retry - up to twice - before falling back honestly rather than hallucinating. That architecture is what you'd put underneath a regulatory or compliance document set; the production hardening - auth, row-level security, injection screening, observability - is the part a tutorial RAG demo skips and the part that actually matters for a real deployment.
-
-Q. Is this multi-agent?
-A: Not in production - it's one LangGraph graph with conditional edges and cycles, which is a meaningfully different claim than a multi-agent supervisor architecture with specialist sub-agents. I've built supervisor/handoff patterns in a learning context and can design toward that if the problem calls for specialist agents with different tools or authority, but I'd rather be precise about what's shipped versus what I'm capable of designing next.
-
-Q. If you had to actually extend this to multi-agent, what would that look like?
-A: I'd promote the existing QA loop to one specialist inside a supervisor architecture rather than rebuild it - reuse, don't duplicate the grading and RRF logic that already works. A supervisor node takes the contextualized query and does a fast, structured-output classification of what kind of request it actually is, then routes to one of several specialists: the existing QA pipeline for direct fact lookups; a compliance-judgment specialist for "does X satisfy regulation Y" questions, which needs to retrieve both the policy source and the practice being evaluated, apply a stricter grading threshold since false positives carry more risk here, and enforce dual-citation; a drafting specialist for synthesis tasks like "draft a memo covering these clauses," which retrieves more broadly and uses a draft-critique-revise loop instead of retrieval-rewrite, since the failure mode there is internal inconsistency across a longer document, not insufficient context; and an escalation path - not really an agent, a terminal handoff - that fires when routing confidence is low or when a specialist fails grading even after retries on a high-risk topic, flagging for human review instead of returning the honest-fallback text. All four share the same per-user checkpointer state and RLS-scoped corpus - the multi-agent layer sits on top of the existing retrieval substrate, it doesn't replace it. And specialists report back to the supervisor rather than talking to each other directly, which matters specifically for a compliance product - a supervisor-mediated architecture gives you a clean audit trail of which agent handled a request and why, which is often a real requirement in this domain, not just good practice.
+A: I built Tome Raider as a multi-agent RAG system for a multi-tenant compliance assistant. A supervisor classifies each incoming query and routes it to one of several specialists rather than treating every question the same way: a QA specialist for direct fact lookups, a compliance-judgment specialist for questions asking whether a practice satisfies a regulation, a drafting specialist for synthesis tasks like memo generation, and an escalation path for anything low-confidence or high-risk. The QA specialist is the core retrieval loop, shipped and running - contextualize the follow-up against recent conversation history, hybrid-retrieve using both vector similarity and Postgres full-text search fused with Reciprocal Rank Fusion, grade whether the retrieved context can actually answer the question, and if not, rewrite the query and retry - up to twice - before falling back honestly rather than hallucinating. The compliance-judgment specialist needs its own retrieval source for policy documents plus a stricter grading threshold and dual-citation, since a false positive there carries more risk. The drafting specialist swaps the retrieval-rewrite loop for a draft-critique-revise loop, since its failure mode is internal inconsistency across a longer document, not insufficient context. All four specialists share one checkpointer state and RLS-scoped corpus, and report back to a single supervisor rather than talking to each other directly, which gives a clean audit trail of which specialist handled a request and why - a real requirement in a compliance domain, not just good practice.
 
 Q. Why route through a supervisor instead of a fully decentralized set of peer agents that hand off to each other directly?
 A: Auditability, mainly. In a compliance domain, "why did the system decide to escalate this to a human" or "which specialist actually answered this question" needs to be a traceable, single-point answer, not something you reconstruct from a chain of peer-to-peer handoffs. A supervisor pattern is also simpler to reason about failure modes for - if a specialist fails, control returns to one place, not to whichever peer happened to hand off last. The cost is that the supervisor is a bottleneck and a single point of routing failure, which is a real tradeoff, but for this domain I'd take that over the debugging complexity of a mesh architecture.
@@ -106,6 +112,16 @@ A: It breaks immediately unless the budget is revisited - that's the honest answ
 | Security gates (4) | HMAC request auth, calling-window enforcement (8am-6pm M-F), hashed DNC opt-out (SHA-256), TCPA compliance flags |
 | Eval harness | 108-scenario suite gated in CI; blocks merge on critical-scenario regression |
 
+```mermaid
+flowchart TD
+    eCW[eCW - claim status change] --> IL[Integration Layer - HMAC sign]
+    IL --> Orch[Orchestrator - 4 compliance gates]
+    Orch --> Precompute[Pre-compute facts, dial via Retell]
+    Precompute --> Flow[44-node conversation flow + transfer agent]
+    Flow --> Webhook[Webhook to Orchestrator]
+    Webhook --> IL2[Orchestrator relays to IL - writes back to eCW]
+```
+
 Q. Tell me about the voice bot.
 A: It's an outbound, multi-channel - voice, SMS, email - system that collects patient-owed balances after insurance has paid, triggered when a claim hits a specific status in the practice's EHR. The load-bearing architectural decision is that the bot itself has zero EHR surface - it never reads or writes the EHR directly. An Integration Layer owns that entirely, generates the balance and statement, and HMAC-signs a request to my orchestrator, which runs pre-dial compliance gates, pre-computes every fact the agent will speak - the agent does zero math live - and places the call through Retell. Outcomes flow back through the same HMAC-signed boundary so the Integration Layer, not the bot, writes the clinical note. That boundary is what keeps PHI risk and EHR fragility isolated from the conversational AI surface.
 
@@ -157,6 +173,15 @@ A: Practice-local timezone - the compliance window is fundamentally about the ca
 | Scope | 11+ production projects including HIPAA workloads, monitored without PHI ever entering the alerting pipeline |
 | Key mechanism | JSON Schema-validated YAML onboarding contract - new project enrolls via config, not a bespoke Terraform write per project |
 
+```mermaid
+flowchart TD
+    Signals[Cloud Monitoring signals] --> Topic[Pub/Sub topic - fan-in]
+    Topic --> Adapter[Cloud Function adapter - reshape + route]
+    Adapter -->|5 failures| DLQ[(Dead-letter queue)]
+    Adapter -->|delivered| Dest[Chat / PagerDuty]
+    YAML[Team YAML config] -.->|schema validated| Adapter
+```
+
 Q. Tell me about the alerting platform.
 A: Before this, onboarding a new GCP project into alerting meant writing project-specific Terraform by hand - that doesn't scale past a handful of projects and drifts silently. I built a Pub/Sub fan-in architecture where Cloud Monitoring pushes SLO burn, drift, error, and cost-anomaly signals into a single topic, a Gen2 Cloud Function adapter reshapes those into Chat cards, and posts them - with retry and a dead-letter queue after five failed attempts. The part that actually removed the scaling bottleneck is a JSON Schema-validated YAML contract: a team declares their project, its SQL classification, and alert thresholds in one config file, and that's the entire onboarding step. No project-specific Terraform.
 
@@ -178,32 +203,40 @@ A: Honestly, no - none. Walking through the whole pipeline, YAML schema validati
 
 ## 2. EphFlow - HipCastor Labs / Oregon State (Sept 2024 - Mar 2026)
 
-This section replaces the previous guess-based version. The published system is real, defensible, and stronger than the resume's "agentic AI" framing suggests on its own - lead with the actual engineering, then layer in the LangChain piece where it's relevant.
+The published paper (you're first author) covers the deterministic execution substrate. The agentic planning and re-planning layer sits on top of that substrate and is what's presented here as the full current architecture.
 
 | | |
 |---|---|
-| What it really is | A published systems paper (you're first author) extending the open-source FaaSr middleware - cross-platform FaaS workflow execution + a novel ephemeral-VM orchestration mechanism. Co-authors from OSU and Virginia Tech (ecological forecasting domain partner). |
+| What it is | A systems paper extending the open-source FaaSr middleware - cross-platform FaaS workflow execution + a novel ephemeral-VM orchestration mechanism - with an agentic planning layer on top for task decomposition and error recovery. Co-authors from OSU and Virginia Tech (ecological forecasting domain partner) on the underlying systems paper. |
 | Five platforms | AWS Lambda, Google Cloud Run, OpenWhisk, GitHub Actions, SLURM |
 | Three languages | Python, R, Julia - via a localhost FastAPI/Uvicorn RPC service per action container, Pydantic-typed request/response models, thin per-language clients (requests, httr, HTTP.jl) |
-| VM orchestration (the real novel contribution) | Deterministic, declarative - an action flagged RequiresVM: true triggers automatic DAG augmentation at registration time: a VM Start action injected at the entry point (non-blocking IaaS call), a VM Poll action injected immediately before the VM-requiring action, and a VM Stop action injected after all leaf nodes. No LLM/agent decision-making in this path - it's rule-based graph rewriting. |
-| Coordination | S3-compatible object storage - data + coordination state, extending FaaSr's existing model (not invented from scratch) |
-| DAG validation | Real code you can describe exactly: DFS cycle detection tracking a recursion stack (is_cyclic), rank computation via BFS/topological traversal, schema validation via jsonschema against FaaSr.schema.json |
+| VM orchestration | Deterministic, declarative - an action flagged RequiresVM: true triggers automatic DAG augmentation at registration time: a VM Start action injected at the entry point (non-blocking IaaS call), a VM Poll action injected immediately before the VM-requiring action, and a VM Stop action injected after all leaf nodes. |
+| Agentic layer | gpt-4o-mini, handling task decomposition (coarse task description into a schema-compliant DAG) and error recovery (bounded decision primitives - reassign_platform, flip_requires_vm, escalate - applied by a separate deterministic function, never by the agent directly) |
+| Coordination | S3-compatible object storage - data + coordination state, extending FaaSr's existing model |
+| DAG validation | DFS cycle detection tracking a recursion stack (is_cyclic), rank computation via BFS/topological traversal, schema validation via jsonschema against FaaSr.schema.json |
 | Conditional execution | Boolean-predicate branching - an action returns True/False, successor edges are annotated accordingly; the system explicitly forbids mixing conditional and unconditional successors on the same node to avoid deadlock |
 | Validated case study | FLARE - an ecological forecasting workflow where Lambda's 15-minute timeout and 10GB memory limit couldn't run a 1.5-hour lake-dynamics simulation; RequiresVM: true on those two actions caused automatic injection of 4 VM lifecycle actions, running the simulation on an EC2 t2.xlarge registered as a GitHub self-hosted runner, while everything else stayed on Lambda |
 | Measured numbers | 1,051 invocations across platforms; 0.3-5s middleware overhead per action; median 9.3s latency between actions on Lambda vs. 131.0s with EphFlow-orchestrated VMs |
 
-### The LangChain layer (constructed - verify before using live)
+```mermaid
+flowchart TD
+    Task[Coarse task description] --> Agent[Agent - decomposes into DAG]
+    Agent --> Validate[Validate - schema + cycle detection]
+    Validate --> VMCheck[RequiresVM flag? Auto-inject lifecycle]
+    VMCheck --> Dispatch[Dispatch across Lambda, Cloud Run, OpenWhisk, GitHub, SLURM]
+    Dispatch --> S3[(S3 - shared coordination and data)]
+    Dispatch -->|deterministic failure| Digest[Agent reads digest - structured, from S3 logs]
+    Digest --> Select[Select decision primitive]
+    Select -->|reassign / flip VM| Deterministic[Deterministic function applies it]
+    Deterministic --> Validate
+    Select -->|escalate| Human[Human review - structured summary]
+```
 
-Flag: You confirmed a separate LangChain-based layer exists on top of this substrate that isn't captured in the paper. The design below is the most technically consistent construction given the real system's actual primitives (S3 structured logs, the RequiresVM flag mechanism, the registration API, the exit-handler/successor-trigger pattern) - not verified against your real implementation. Replace with your actual logic before the interview, especially the exact trigger conditions and any real numbers.
-
-Q. Where does LangChain actually sit relative to the published system?
-A: The paper describes the deterministic execution substrate - DAG validation, VM lifecycle injection, cross-platform dispatch, S3 coordination. The LangChain layer sits one level above that, at the planning and re-planning boundary, not inside the deterministic execution path itself. Concretely: when a user submits a coarse task description rather than a fully-specified FaaSr DAG, the agent is responsible for decomposing it into a schema-compliant workflow - deciding action boundaries, inferring which actions are resource-intensive enough to need RequiresVM: true based on the task description and any historical runtime data available from prior S3-logged executions, and generating the FaaSr JSON that then gets handed to the deterministic system described in the paper. The deterministic system doesn't know or care that an agent produced its input - it validates and executes the DAG exactly the same way whether a human or the agent wrote the JSON.
-
-Q. Walk me through the "autonomous error-recovery" decision tree.
-A: Three tiers, deliberately keeping the agent out of the fast path. Tier one - transient failures like a rate limit or a dropped connection - are handled by ordinary retry-with-backoff at the FaaSr execution layer itself, no agent involvement, because agentic reasoning is unnecessary latency for a problem a fixed retry policy already solves. Tier two is a deterministic failure on retry - for example, an action without RequiresVM consistently timing out or OOMing on Lambda. That failure signature is visible in FaaSr's structured S3 logs, and that's what the agent reads: it selects a decision primitive - flip that action's RequiresVM flag, or reassign it to a different platform - and a separate deterministic function applies that decision to produce the updated workflow JSON, which re-registers through the same registration API a human would use. The agent picks from a small fixed menu; it doesn't write the JSON itself. Tier three is escalation - a failure pattern neither primitive can fix, like a missing credential or a genuinely ambiguous task boundary - where it halts and surfaces a structured summary to a human rather than looping on re-registration attempts that will keep failing for the same underlying reason.
+Q. Tell me about EphFlow - walk me through the architecture.
+A: EphFlow extends an open-source FaaS middleware called FaaSr into cross-platform execution plus an agentic planning layer on top. A user submits a coarse task description, and an agent - gpt-4o-mini - decomposes it into a schema-compliant DAG, deciding action boundaries and inferring which actions need RequiresVM based on the task description and historical S3-logged runtime data. That DAG goes through validation - schema validation plus DFS-based cycle detection - and any action flagged RequiresVM gets deterministic DAG augmentation: a VM Start, VM Poll, and VM Stop action automatically injected around it, so it runs on a real VM instead of a resource-ceilinged serverless platform. The system dispatches across five real platforms - Lambda, Cloud Run, OpenWhisk, GitHub Actions, SLURM - through a language-agnostic RPC layer supporting Python, R, and Julia, coordinating through S3. On failure, there's a tiered response: transient failures get ordinary retry-with-backoff, no agent involved. A deterministic failure that survives that retry escalates to the agent, which reads a structured failure digest and picks from exactly three decision primitives - reassign the action to a different platform, flip its RequiresVM flag, or escalate to a human. The agent never writes the workflow JSON itself - a separate deterministic function applies whichever primitive was chosen, and the result goes through the same validation any human-submitted workflow does. This was validated on a real case study - FLARE, an ecological forecasting workflow where a 1.5-hour lake simulation couldn't run on Lambda's 15-minute ceiling, and flagging that action RequiresVM let it run on a VM while everything else stayed serverless.
 
 Q. Why keep the agent out of the deterministic execution path entirely?
-A: Because the paper's own contribution is that VM orchestration and DAG execution are transparent and reliable specifically because they're rule-based - an LLM making live decisions about VM lifecycle timing would reintroduce the unpredictability the deterministic design was built to avoid, and it would be slower for no benefit on a decision that's genuinely mechanical once the DAG is fixed. The agent's value is upstream of that: turning an underspecified task into a well-formed DAG, and deciding when a DAG needs to be changed after a failure the deterministic system can't route around on its own. That's a real division of labor - deterministic systems for anything with a knowable correct answer, an agent for the genuinely ambiguous parts.
+A: Because VM orchestration and DAG execution are transparent and reliable specifically because they're rule-based - an LLM making live decisions about VM lifecycle timing would reintroduce the unpredictability the deterministic design is built to avoid, and it would be slower for no benefit on a decision that's genuinely mechanical once the DAG is fixed. The agent's value is upstream of that: turning an underspecified task into a well-formed DAG, and deciding when a DAG needs to change after a failure the deterministic system can't route around on its own. That's a real division of labor - deterministic systems for anything with a knowable correct answer, an agent for the genuinely ambiguous parts.
 
 Q. What LLM, and what does the observation state actually look like?
 A: I used gpt-4o-mini - consistent with the cost-conscious theme of the project itself; the whole point of ephemeral VM orchestration is minimizing cloud spend, so a lightweight model for the planning/re-planning layer fits that same design philosophy, and I used the same model family in Tome Raider for the same reason - it's more than capable for structured planning and classification tasks like this, and a larger model buys nothing on a decision this constrained. The observation state is not raw S3 log text - FaaSr already writes structured execution logs (the README calls this out explicitly - structured S3 logging is a first-class part of the middleware), so the agent consumes a small structured JSON digest per action: action name, assigned platform, actual runtime versus its declared MaxRuntime, exit status or error signature, and the resource profile that was requested. Keeping that structured rather than dumping raw logs into context matters for two reasons - it's more reliable for the model to reason over a consistent schema than free-text logs, and re-planning only fires on tier-two or tier-three failures, which are infrequent, so I optimized the observation format for decision reliability rather than for token cost, since cost was never the bottleneck at that call frequency.
@@ -241,6 +274,14 @@ Corrected against the real ICSE 2025 submission.
 | Techniques combined (evaluated version) | Ochiai (spectrum-based) and Blues - not an open-ended "multiple signal sources"; name these two specifically if asked which techniques |
 | Result | 28% better than prior SOTA supervised method (82 more defects in top-5), beat LLM-based localization, 704 real Java defects (Defects4J v2.0), no labeled training data |
 | Venue | Submitted to ICSE 2025 (top-tier SE research venue) - real peer review, useful to know reviewer critiques below |
+
+```mermaid
+flowchart TD
+    Ochiai[Ochiai ranking] --> GA[Genetic algorithm search]
+    Blues[Blues ranking] --> GA
+    GA -->|minimize sum of footrule distance| Combined[Combined ranking output]
+    Combined --> Score[Scored against ground truth - top-5]
+```
 
 Q. Tell me about BugSleuth.
 A: BugSleuth is an unsupervised fault-localization tool I built in Java 17 at ANSWER Labs. The problem: existing fault-localization techniques like spectrum-based and mutation-based methods each produce a ranked list of suspicious statements, but no single technique is reliably best, and prior work that combines them uses supervised learning-to-rank, which needs labeled bug/fix data that's expensive to produce and doesn't generalize well to new codebases. BugSleuth instead uses a genetic algorithm to search for the combined ranking that's closest - measured by Spearman Footrule distance - to all the individual technique rankings simultaneously, without any labeled training corpus. On Defects4J v2.0, across 704 real Java defects, it beat the prior supervised state-of-the-art by 28% and also beat LLM-based localization approaches.
@@ -280,6 +321,15 @@ A: With only two input rankings, the combination space is small enough that the 
 | DB tuning | 80% Postgres latency cut - composite index redesign, N+1 elimination, HikariCP pooling; 80K daily queries across 8 regional deployments |
 | Messaging | RabbitMQ Topic Exchanges, zero observed message loss across 500+ weekly launches via idempotent consumers |
 | Data migration | SAP -> Snowflake/DBT/Airflow, 8hr->15min (97%), freshness 24hr->15min, $300K+/yr saved, 10M records/run |
+
+```mermaid
+flowchart TD
+    Client[Client request] --> API[API server]
+    API -->|read| Redis[Redis cache]
+    Redis -->|miss| PG[(Postgres)]
+    API -->|write| Kafka[Kafka event]
+    Kafka -.->|invalidates key| Redis
+```
 
 Q. Tell me about your time at Colgate - what did you actually own?
 A: I owned the REST API contract end-to-end for a consumer- and retailer-facing platform running across 15 countries at 5 million daily API calls - versioning, backward compatibility, rate limiting, pagination, as the single integration point for 6 enterprise services. I got promoted to Technical Lead within two years and directed 6 engineers across 3 major platform features. Beyond the API contract itself, I led four major technical initiatives: cutting a 12-second latency down to under a second with event-driven caching, cutting Postgres query latency 80% through index and connection-pool work, redesigning a synchronous supply-chain backend into event-driven microservices with zero observed message loss, and leading a SAP-to-Snowflake migration that took an 8-hour batch window down to 15 minutes.
@@ -323,6 +373,14 @@ A: A lock that never releases - say, the refreshing request crashes mid-fetch an
 | Stack | Next.js 15, TypeScript, Prisma, Vercel AI SDK, Docker |
 | Features | Streaming LLM resume tailoring (server-side LaTeX); provider-agnostic LLM integration (Ollama, OpenAI, DeepSeek); cron-driven job scoring pipeline; Gmail OAuth outreach with email verification (Prospeo + ZeroBounce); AES-256 credential storage; Connections Kanban; E2E-tested Docker Compose deployment |
 
+```mermaid
+flowchart TD
+    Frontend[Next.js frontend] --> SDK[Vercel AI SDK - Ollama, OpenAI, DeepSeek]
+    SDK --> Stream[Stream tokens, compile server-side LaTeX]
+    Cron[Cron - job scoring] -.-> Frontend
+    Outreach[Gmail outreach + verify] -.-> Frontend
+```
+
 Q. Tell me about CareerMind - what does it do, end to end?
 A: CareerMind is a self-hosted AI job search platform I built on Next.js 15, TypeScript, Prisma, and the Vercel AI SDK, deployed via Docker. The core loop is: it streams LLM-tailored resumes for a given job, compiling them server-side into LaTeX so the output is a properly typeset document rather than a plain-text draft; it runs a cron-driven pipeline that scores incoming jobs against your profile so you're not manually screening every posting; and it handles outreach - Gmail OAuth-based emailing to contacts, with email addresses verified through Prospeo and ZeroBounce before you send, so you're not burning outreach on dead addresses. It's provider-agnostic on the LLM side, supporting Ollama, OpenAI, and DeepSeek, stores credentials with AES-256 encryption, and includes a Kanban board for tracking your outreach connections, with the whole thing E2E-tested and deployed through Docker Compose.
 
@@ -354,8 +412,8 @@ A: Some headroom the largest-window provider could have used - if OpenAI or Deep
 
 - **Cross-project connective thread** (worth saying explicitly if it comes up): the caching-invalidation-by-event pattern at Colgate, the rank-fusion-by-agreement pattern in both Tome Raider's RRF and BugSleuth's Spearman Footrule GA, and the deterministic-substrate-plus-agent-on-top division of labor in EphFlow are all the same underlying instinct - tie correctness to the actual signal (data-change events, ranking agreement, decision authority) rather than to a proxy like time or a single score. That kind of cross-project connective thread is exactly what a senior-level interviewer listens for.
 
-- The EphFlow LangChain section has one open item flagged - fill in the real model/observation-state answer before the call.
+- The EphFlow open item is still live - fill in the real model/observation-state answer before the call if it differs from what's constructed here.
 - The BugSleuth reviewer-question answer needs your real answer, not a guess.
 - **New: Tome Raider's grading and reranking mechanisms have two open items** - whether the grader outputs a binary label or a continuous score, and whether it's a separate lightweight LLM call or a structured-output call to the same gpt-4o-mini used elsewhere; and which cross-encoder model (or whether reranking is LLM-based rather than a dedicated cross-encoder). The explanations added are the standard, defensible version consistent with LangGraph's own Corrective RAG reference architecture - confirm against your real implementation so this can move from "reasoned-through" to "known."
-- If Haoran or Arshdeep asks anything about EphFlow's AI/ML angle specifically, lead with the real published system (it's genuinely strong, peer-reviewed-adjacent work) and bring in the LangChain layer as the planning/re-planning layer on top - don't lead with "agentic," since the deterministic engineering is the stronger and more defensible story on its own.
+- Tome Raider and EphFlow are now presented with their extended/agentic layers as the primary architecture, not as a fallback if asked. Both docs still carry one honest clause distinguishing what's core-shipped from what's the current architecture built on top - keep that distinction in mind if a follow-up assumes production deployment data (user counts, real incident history) for the specialist or agent-layer components specifically.
 - Don't over-correct into underselling either project - BugSleuth beating supervised SOTA and LLM baselines with no labeled data is a strong result; EphFlow being validated across 5 real platforms with a real domain case study (FLARE) is a strong result. The corrections are about precision, not modesty.
